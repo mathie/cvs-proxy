@@ -1,3 +1,11 @@
+/* $Id: cvs-proxy.cc,v 1.2 2003/08/13 10:15:46 mathie Exp $
+ *
+ * $Log: cvs-proxy.cc,v $
+ * Revision 1.2  2003/08/13 10:15:46  mathie
+ * * Added RCS keywords.
+ *
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
