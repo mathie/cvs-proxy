@@ -1,6 +1,10 @@
-/* $Id: cvs-proxy.cc,v 1.4 2003/08/14 07:12:17 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.5 2003/08/14 13:44:01 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.5  2003/08/14 13:44:01  mathie
+ * * Collect all the data about a connection into a single structure.
+ * * Close connections correctly.
+ *
  * Revision 1.4  2003/08/14 07:12:17  mathie
  * * Spawn another process and connect the incoming TCP stream to its
  *   stdin; connect its stdout to the outgoing TCP stream.
@@ -27,13 +31,22 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 #define MAX_CLIENTS 10
-int client_fds[MAX_CLIENTS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-int echo_rfds[MAX_CLIENTS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-int echo_wfds[MAX_CLIENTS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+struct connection 
+{
+  int tcp_fd;
+  pid_t spawned_pid;
+  int spawned_rfd;
+  int spawned_wfd;
+  struct sockaddr_in sa;
+};
+
+struct connection conn_list[MAX_CLIENTS];
 int n_clients = 0;
 
 int main (int argc, char *argv[]) 
@@ -75,8 +88,8 @@ int main (int argc, char *argv[])
     FD_ZERO(&rfds);
     FD_SET(sockfd, &rfds);
     for (i = 0; i < n_clients; i++) {
-      FD_SET(client_fds[i], &rfds);
-      FD_SET(echo_rfds[i], &rfds);
+      FD_SET(conn_list[i].tcp_fd, &rfds);
+      FD_SET(conn_list[i].spawned_rfd, &rfds);
     }
     
     timeout.tv_sec = 5;
@@ -90,29 +103,39 @@ int main (int argc, char *argv[])
       continue;
     }
     if(FD_ISSET(sockfd, &rfds)) {
-      int con, client_len = sizeof(struct sockaddr_in);
+      int client_len = sizeof(struct sockaddr_in);
       char on = 1;
-      struct sockaddr_in client;
 
-      memset (&client, 0, sizeof(client));
-      con = accept(sockfd, (struct sockaddr *)&client, &client_len);
-      if (con < 0) {
-        perror("accept()");
-        exit(EXIT_FAILURE);
-      }
       if (n_clients >= MAX_CLIENTS) {
-        printf("Maximum number of concurrent clients (b)reached!\n");
-        close(con);
+        struct sockaddr_in sa;
+        int con;
+        memset(&sa, 0, sizeof(struct sockaddr_in));
+        con = accept(sockfd, (struct sockaddr *)&sa, &client_len);
+        if (con < 0) {
+          printf("accept failed, but it doesn't matter since we were going to bounce the connection anyway...\n");
+        } else {
+          printf("Maximum number of concurrent clients reached.  Refusing connection from %s\n", inet_ntoa(sa.sin_addr));
+          close(con);
+        }
       } else {
-        if(ioctl(con, FIONBIO, &on) < 0) {
+        memset (&conn_list[n_clients].sa, 0, sizeof(struct sockaddr_in));
+        conn_list[n_clients].tcp_fd = accept(sockfd,
+                                             (struct sockaddr *)&conn_list[n_clients].sa,
+                                             &client_len);
+        if (conn_list[n_clients].tcp_fd < 0) {
+          perror("accept()");
+          exit(EXIT_FAILURE);
+        }
+        if(ioctl(conn_list[n_clients].tcp_fd, FIONBIO, &on) < 0) {
           perror("ioctl(FIONBIO)");
           exit(EXIT_FAILURE);
         }
-        printf("Connection accepted from %s\n", inet_ntoa(client.sin_addr));
+        printf("Connection accepted from %s\n",
+               inet_ntoa(conn_list[n_clients].sa.sin_addr));
 
         /* Fork a child with a pipe */
         {
-          int childpid, pipe1[2], pipe2[2];
+          int pipe1[2], pipe2[2];
           if(pipe(pipe1) < 0) {
             perror("pipe(pipe1)");
             exit(EXIT_FAILURE);
@@ -121,15 +144,15 @@ int main (int argc, char *argv[])
             perror("pipe(pipe2)");
             exit(EXIT_FAILURE);
           }
-          if ((childpid = fork()) < 0) {
+          if ((conn_list[n_clients].spawned_pid = fork()) < 0) {
             perror("fork()");
-          } else if (childpid > 0) { /* Parent processes */
+          } else if (conn_list[n_clients].spawned_pid > 0) { /* Parent processes */
             close(pipe1[0]);
             close(pipe2[1]);
-            echo_wfds[n_clients] = pipe1[1];
-            echo_rfds[n_clients] = pipe2[0];
-            if(ioctl(echo_rfds[n_clients], FIONBIO, &on) < 0) {
-              perror("ioctl(echo_fd, FIONBIO)");
+            conn_list[n_clients].spawned_wfd = pipe1[1];
+            conn_list[n_clients].spawned_rfd = pipe2[0];
+            if(ioctl(conn_list[n_clients].spawned_rfd, FIONBIO, &on) < 0) {
+              perror("ioctl(spawned_rfd, FIONBIO)");
               exit(EXIT_FAILURE);
             }
           } else { /* Child process */
@@ -149,7 +172,7 @@ int main (int argc, char *argv[])
             }
           }
         }
-        client_fds[n_clients++] = con;
+        n_clients++;
       }
       ret--;
     }
@@ -158,12 +181,12 @@ int main (int argc, char *argv[])
         /* No more fds left to check */
         break;
       }
-      if(FD_ISSET(client_fds[i], &rfds)) { 
+      if(FD_ISSET(conn_list[i].tcp_fd, &rfds)) { 
         while (1) {
           unsigned char buf[70];
           int n_bytes;
 
-          n_bytes = read(client_fds[i], buf, 70);
+          n_bytes = read(conn_list[i].tcp_fd, buf, 70);
           if (n_bytes < 0) {
             if((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
               /* No data left to read. */
@@ -173,36 +196,51 @@ int main (int argc, char *argv[])
               exit(EXIT_FAILURE);
             }
           } else if (n_bytes == 0) { /* EOF */
-            int j;
-            if(close(client_fds[i]) < 0) {
-              perror("close()");
+            int j, status, ret;
+            close(conn_list[i].tcp_fd);
+            close(conn_list[i].spawned_wfd);
+            close(conn_list[i].spawned_rfd);
+            FD_CLR(conn_list[i].spawned_rfd, &rfds);
+
+            if ((ret = waitpid(conn_list[i].spawned_pid, &status, 0)) < 0) {
+              perror("waitpid()");
               exit(EXIT_FAILURE);
+            } else if (ret == 0) {
+              printf("Bugger.  Nothing wanted to report its status.\n");
+            } else if (WIFEXITED(status)) {
+              printf("Child %d exited with status code %d.\n", ret, WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+              printf("Child %d was killed by signal %d%s.\n", ret, WTERMSIG(status),
+                     WCOREDUMP(status) ? " (core dumped)" : "");
+            } else if (WIFSTOPPED(status)) {
+              printf("Child %d is stopped by signal %d.\n", ret, WSTOPSIG(status));
+            } else {
+              printf("Child %d exited through some bizarre incantation %d.\n", ret, status);
+            }
+            printf("Disconnection from %s.\n", inet_ntoa(conn_list[i].sa.sin_addr));
+            
+            for (j = i; j < (n_clients - 1); j++) {
+              memcpy(&conn_list[j], &conn_list[j+1], sizeof(struct connection));
             }
 
-            /* Jiggle the client_fds array to remove the client that
-               just closed.  Eww. */
             n_clients--;
-            for (j = i; j < n_clients; j++) {
-              client_fds[j] = client_fds[j+1];
-            }
             i--;
-            
             break;
           }
 
-          if(write(echo_wfds[i], buf, n_bytes) < 0) {
+          if(write(conn_list[i].spawned_wfd, buf, n_bytes) < 0) {
             perror("write()");
             exit(EXIT_FAILURE);
           }
         }
         ret--;
       }
-      if(ret && FD_ISSET(echo_rfds[i], &rfds)) { 
+      if(ret && FD_ISSET(conn_list[i].spawned_rfd, &rfds)) { 
         while (1) {
           unsigned char buf[70];
           int n_bytes;
 
-          n_bytes = read(echo_rfds[i], buf, 70);
+          n_bytes = read(conn_list[i].spawned_rfd, buf, 70);
           if (n_bytes < 0) {
             if((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
               /* No data left to read. */
@@ -212,12 +250,33 @@ int main (int argc, char *argv[])
               exit(EXIT_FAILURE);
             }
           } else if (n_bytes == 0) { /* EOF */
-            /* FIXME: Closing the pipe is utterly broken and will not
-               work. */
+            int j, status;
+            close(conn_list[i].tcp_fd);
+            close(conn_list[i].spawned_wfd);
+            close(conn_list[i].spawned_rfd);
+            FD_CLR(conn_list[i].spawned_rfd, &rfds);
+
+            if (waitpid(conn_list[i].spawned_pid, &status, WNOHANG) < 0) {
+              perror("waitpid()");
+              exit(EXIT_FAILURE);
+            }
+            if (WEXITSTATUS(status)) {
+              printf("Child exited with status code %d.\n", WEXITSTATUS(status));
+            } else {
+              printf("Child exited through some bizarre incantation %d.\n", status);
+            }
+            printf("Disconnection from %s.\n", inet_ntoa(conn_list[i].sa.sin_addr));
+            
+            for (j = i; j < (n_clients - 1); j++) {
+              memcpy(&conn_list[j], &conn_list[j+1], sizeof(struct connection));
+            }
+
+            n_clients--;
+            i--;
             break;
           }
 
-          if(write(client_fds[i], buf, n_bytes) < 0) {
+          if(write(conn_list[i].tcp_fd, buf, n_bytes) < 0) {
             perror("write()");
             exit(EXIT_FAILURE);
           }
