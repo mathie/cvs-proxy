@@ -1,6 +1,9 @@
-/* $Id: cvs-proxy.cc,v 1.12 2003/08/15 14:20:39 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.13 2003/08/15 14:34:44 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.13  2003/08/15 14:34:44  mathie
+ * * Tidy up fork_child()
+ *
  * Revision 1.12  2003/08/15 14:20:39  mathie
  * * Optionally, run as a daemon.
  * * Catch sig(int|term) and cleanup before quitting.
@@ -91,7 +94,7 @@ char *cvs_binary = NULL, *local_cvs_root = NULL, *remote_cvs_host = NULL,
 int daemonize = 1, daemonized = 0;
 int sockfd = -1;
 
-static const char rcsinfo[] = "$Id: cvs-proxy.cc,v 1.12 2003/08/15 14:20:39 mathie Exp $";
+static const char rcsinfo[] = "$Version$";
 
 void sighandler(int sig, siginfo_t *sip, void *scp);
 void cleanup(int retcode);
@@ -150,7 +153,7 @@ int main (int argc, char *argv[])
     cleanup(EXIT_FAILURE);
   }
 
-  log(LOG_INFO, "Daemon version %s started.\n", rcsinfo);
+  log(LOG_INFO, "Daemon %s started.\n", rcsinfo);
   
   while(1) {
     struct timeval timeout;
@@ -394,51 +397,54 @@ struct connection *accept_connection(int sockfd)
 
 int fork_child(struct connection *con)
 {
-  int pipe1[2], pipe2[2], pipe3[2], on = 1;
-  if(pipe(pipe1) < 0) {
+  int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2], on = 1;
+  if(pipe(stdin_pipe) < 0) {
     return -1;
   }
-  if(pipe(pipe2) < 0) {
+  if(pipe(stdout_pipe) < 0) {
     int old_errno = errno;
-    close(pipe1[0]);
-    close(pipe1[1]);
+    close(stdin_pipe[0]);
+    close(stdin_pipe[1]);
     errno = old_errno;
     return -1;
   }
-  if(pipe(pipe3) < 0) {
+  if(pipe(stderr_pipe) < 0) {
     int old_errno = errno;
-    close(pipe1[0]);
-    close(pipe1[1]);
-    close(pipe2[0]);
-    close(pipe2[1]);
+    close(stdin_pipe[0]);
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    close(stdout_pipe[1]);
     errno = old_errno;
     return -1;
   }
 
   if ((con->spawned_pid = fork()) < 0) {
     int old_errno = errno;
-    close(pipe1[0]);
-    close(pipe1[1]);
-    close(pipe2[0]);
-    close(pipe2[1]);
-    close(pipe3[0]);
-    close(pipe3[1]);
+    close(stdin_pipe[0]);
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    close(stdout_pipe[1]);
+    close(stderr_pipe[0]);
+    close(stderr_pipe[1]);
     errno = old_errno;
     return -1;
   } else if(con->spawned_pid == 0) { /* Child process */
-    close(pipe1[1]);
-    close(pipe2[0]);
-    close(pipe3[0]);
-    if(dup2(pipe1[0], STDIN_FILENO) < 0) {
-      perror("dup2(STDIN)");
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    close(stderr_pipe[0]);
+    if(dup2(stdin_pipe[0], STDIN_FILENO) < 0) {
+      log(LOG_ERR, "Failed to attach pipe to child stdin: %s.\n",
+          strerror(errno));
       exit(EXIT_FAILURE);
     }
-    if(dup2(pipe2[1], STDOUT_FILENO) < 0) {
-      perror("dup2(STDOUT)");
+    if(dup2(stdout_pipe[1], STDOUT_FILENO) < 0) {
+      log(LOG_ERR, "Failed to attach pipe to child stdout: %s.\n",
+          strerror(errno));
       exit(EXIT_FAILURE);
     }
-    if(dup2(pipe3[1], STDERR_FILENO) < 0) {
-      perror("dup2(STDERR)");
+    if(dup2(stderr_pipe[1], STDERR_FILENO) < 0) {
+      log(LOG_ERR, "Failed to attach pipe to child stderr: %s.\n",
+          strerror(errno));
       exit(EXIT_FAILURE);
     }
     /* Close all other open descriptors */
@@ -449,17 +455,17 @@ int fork_child(struct connection *con)
     
     if (execl(cvs_binary, cvs_binary, "--allow-root", local_cvs_root,
               "pserver", NULL) < 0) {
-      perror("exec()");
+      log(LOG_ERR, "Failed to exec() CVS server: %s.\n", strerror(errno));
       exit(EXIT_FAILURE);
     }
   }
   
-  close(pipe1[0]);
-  close(pipe2[1]);
-  close(pipe3[1]);
-  con->spawned_wfd = pipe1[1];
-  con->spawned_rfd = pipe2[0];
-  con->spawned_stderr = pipe3[0];
+  close(stdin_pipe[0]);
+  close(stdout_pipe[1]);
+  close(stderr_pipe[1]);
+  con->spawned_wfd = stdin_pipe[1];
+  con->spawned_rfd = stdout_pipe[0];
+  con->spawned_stderr = stderr_pipe[0];
   if(ioctl(con->spawned_rfd, FIONBIO, &on) < 0) {
     int old_errno = errno;
     close(con->spawned_wfd);
@@ -581,10 +587,10 @@ int read_from_child_stderr(struct connection *con)
 int fdcpy(int dst, int src) 
 {
   while (1) {
-    unsigned char buf[70];
+    unsigned char buf[1024];
     int n_bytes;
 
-    n_bytes = read(src, buf, 70);
+    n_bytes = read(src, buf, 1024);
     if (n_bytes < 0) {
       if((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
         /* No data left to read. */
