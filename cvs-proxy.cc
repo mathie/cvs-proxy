@@ -1,6 +1,10 @@
-/* $Id: cvs-proxy.cc,v 1.10 2003/08/15 10:38:41 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.11 2003/08/15 10:46:42 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.11  2003/08/15 10:46:42  mathie
+ * * Cache the 'next' entry when going through the connection lists as the
+ *   current entry may be deleted if the connection is closed.
+ *
  * Revision 1.10  2003/08/15 10:38:41  mathie
  * * Fix option parsing for -d.
  * * exec() the CVS binary, passing in the appropriate arguments.
@@ -106,7 +110,7 @@ int main (int argc, char *argv[])
     struct timeval timeout;
     struct fd_set rfds;
     int n_active_fds;
-    struct connection *cur;
+    struct connection *cur, *next;
 
     FD_ZERO(&rfds);
     FD_SET(sockfd, &rfds);
@@ -136,7 +140,11 @@ int main (int argc, char *argv[])
       }
       n_active_fds--;
     }
-    for(cur = conn_list; cur && n_active_fds; cur = cur->next) {
+    for(cur = conn_list; cur && n_active_fds; cur = next) {
+      /* cur may be deleted somewhere in here, so we cache next right at
+         the start. */
+      next = cur->next;
+      
       if(FD_ISSET(cur->tcp_fd, &rfds)) {
         read_from_tcp(cur);
         n_active_fds--;
