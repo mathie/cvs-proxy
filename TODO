@@ -1,3 +1,10 @@
+$Id: TODO,v 1.2 2003/08/14 07:39:56 mathie Exp $
+
 TODO list for CVS Proxy
 -----------------------
 
+* Daemonize
+* Accept and parse command line arguments for:
+  - Local CVS binary path
+  - Local CVS root
+  - Remote CVS host, port and path
