@@ -1,6 +1,10 @@
-/* $Id: cvs-proxy.cc,v 1.9 2003/08/15 07:04:12 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.10 2003/08/15 10:38:41 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.10  2003/08/15 10:38:41  mathie
+ * * Fix option parsing for -d.
+ * * exec() the CVS binary, passing in the appropriate arguments.
+ *
  * Revision 1.9  2003/08/15 07:04:12  mathie
  * * Basic argument parsing and validation.
  *
@@ -104,8 +108,6 @@ int main (int argc, char *argv[])
     int n_active_fds;
     struct connection *cur;
 
-    dump_connection_list();
-    
     FD_ZERO(&rfds);
     FD_SET(sockfd, &rfds);
     for(cur = conn_list; cur; cur = cur->next) {
@@ -152,7 +154,9 @@ int parse_args(int argc, char *argv[])
 {
   struct stat sb;
   int ch;
-  while((ch = getopt(argc, argv, "b:l:h:p:d")) != -1) {
+  while((ch = getopt(argc, argv, "b:l:h:p:d:")) != -1) {
+    printf("arg %c, value = %s.\n", ch, (optarg ? optarg : "(none)"));
+    
     switch(ch) {
     case 'b':
       cvs_binary = strdup(optarg);
@@ -168,6 +172,7 @@ int parse_args(int argc, char *argv[])
       break;
     case 'd':
       remote_cvs_path = strdup(optarg);
+      break;
     default:
       return -1;
     }
@@ -332,7 +337,8 @@ int fork_child(struct connection *con)
       for(i = 3; i < getdtablesize(); i++) close(i); 
     }
     
-    if (execl("/Users/mathie/src/cvs-proxy/echo-stdin", "echo-stdin", NULL) < 0) {
+    if (execl(cvs_binary, cvs_binary, "--allow-root", local_cvs_root,
+              "pserver", NULL) < 0) {
       perror("exec()");
       exit(EXIT_FAILURE);
     }
