@@ -1,6 +1,13 @@
-/* $Id: cvs-proxy.cc,v 1.3 2003/08/13 11:40:21 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.4 2003/08/14 07:12:17 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.4  2003/08/14 07:12:17  mathie
+ * * Spawn another process and connect the incoming TCP stream to its
+ *   stdin; connect its stdout to the outgoing TCP stream.
+ * * Decrement the number of fds that need checked every time one is
+ *   checked, so that wading through the entire client list can be avoided
+ *   for most select() calls.
+ *
  * Revision 1.3  2003/08/13 11:40:21  mathie
  * * Use select() to multiplex handling of multiple connections at once.
  *
@@ -25,6 +32,8 @@
 
 #define MAX_CLIENTS 10
 int client_fds[MAX_CLIENTS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+int echo_rfds[MAX_CLIENTS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+int echo_wfds[MAX_CLIENTS] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 int n_clients = 0;
 
 int main (int argc, char *argv[]) 
@@ -67,6 +76,7 @@ int main (int argc, char *argv[])
     FD_SET(sockfd, &rfds);
     for (i = 0; i < n_clients; i++) {
       FD_SET(client_fds[i], &rfds);
+      FD_SET(echo_rfds[i], &rfds);
     }
     
     timeout.tv_sec = 5;
@@ -99,6 +109,46 @@ int main (int argc, char *argv[])
           exit(EXIT_FAILURE);
         }
         printf("Connection accepted from %s\n", inet_ntoa(client.sin_addr));
+
+        /* Fork a child with a pipe */
+        {
+          int childpid, pipe1[2], pipe2[2];
+          if(pipe(pipe1) < 0) {
+            perror("pipe(pipe1)");
+            exit(EXIT_FAILURE);
+          }
+          if(pipe(pipe2) < 0) {
+            perror("pipe(pipe2)");
+            exit(EXIT_FAILURE);
+          }
+          if ((childpid = fork()) < 0) {
+            perror("fork()");
+          } else if (childpid > 0) { /* Parent processes */
+            close(pipe1[0]);
+            close(pipe2[1]);
+            echo_wfds[n_clients] = pipe1[1];
+            echo_rfds[n_clients] = pipe2[0];
+            if(ioctl(echo_rfds[n_clients], FIONBIO, &on) < 0) {
+              perror("ioctl(echo_fd, FIONBIO)");
+              exit(EXIT_FAILURE);
+            }
+          } else { /* Child process */
+            close(pipe1[1]);
+            close(pipe2[0]);
+            if(dup2(pipe1[0], STDIN_FILENO) < 0) {
+              perror("dup2(STDIN)");
+              exit(EXIT_FAILURE);
+            }
+            if(dup2(pipe2[1], STDOUT_FILENO) < 0) {
+              perror("dup2(STDOUT)");
+              exit(EXIT_FAILURE);
+            }
+            if (execl("/Users/mathie/src/cvs-proxy/echo-stdin", "echo-stdin", NULL) < 0) {
+              perror("exec()");
+              exit(EXIT_FAILURE);
+            }
+          }
+        }
         client_fds[n_clients++] = con;
       }
       ret--;
@@ -140,11 +190,39 @@ int main (int argc, char *argv[])
             break;
           }
 
+          if(write(echo_wfds[i], buf, n_bytes) < 0) {
+            perror("write()");
+            exit(EXIT_FAILURE);
+          }
+        }
+        ret--;
+      }
+      if(ret && FD_ISSET(echo_rfds[i], &rfds)) { 
+        while (1) {
+          unsigned char buf[70];
+          int n_bytes;
+
+          n_bytes = read(echo_rfds[i], buf, 70);
+          if (n_bytes < 0) {
+            if((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
+              /* No data left to read. */
+              break;
+            } else {
+              perror("read()");
+              exit(EXIT_FAILURE);
+            }
+          } else if (n_bytes == 0) { /* EOF */
+            /* FIXME: Closing the pipe is utterly broken and will not
+               work. */
+            break;
+          }
+
           if(write(client_fds[i], buf, n_bytes) < 0) {
             perror("write()");
             exit(EXIT_FAILURE);
           }
         }
+        ret--;
       }
     }
   }
