@@ -1,6 +1,9 @@
-/* $Id: cvs-proxy.cc,v 1.13 2003/08/15 14:34:44 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.14 2003/08/15 14:43:35 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.14  2003/08/15 14:43:35  mathie
+ * * Do the rcsid thing as suggested by ident(1)
+ *
  * Revision 1.13  2003/08/15 14:34:44  mathie
  * * Tidy up fork_child()
  *
@@ -94,7 +97,7 @@ char *cvs_binary = NULL, *local_cvs_root = NULL, *remote_cvs_host = NULL,
 int daemonize = 1, daemonized = 0;
 int sockfd = -1;
 
-static const char rcsinfo[] = "$Version$";
+static char const rcsid[] = "$Id: cvs-proxy.cc,v 1.14 2003/08/15 14:43:35 mathie Exp $";
 
 void sighandler(int sig, siginfo_t *sip, void *scp);
 void cleanup(int retcode);
@@ -153,7 +156,8 @@ int main (int argc, char *argv[])
     cleanup(EXIT_FAILURE);
   }
 
-  log(LOG_INFO, "Daemon %s started.\n", rcsinfo);
+  log(LOG_INFO, "Daemon started.\n");
+  log(LOG_INFO, "%s\n", rcsid);
   
   while(1) {
     struct timeval timeout;
