@@ -1,6 +1,12 @@
-/* $Id: cvs-proxy.cc,v 1.11 2003/08/15 10:46:42 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.12 2003/08/15 14:20:39 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.12  2003/08/15 14:20:39  mathie
+ * * Optionally, run as a daemon.
+ * * Catch sig(int|term) and cleanup before quitting.
+ * * Log to syslog instead of stdout/stderr if running as a daemon.
+ * * Capture stderr of spawned program and log it to syslog/stderr.
+ *
  * Revision 1.11  2003/08/15 10:46:42  mathie
  * * Cache the 'next' entry when going through the connection lists as the
  *   current entry may be deleted if the connection is closed.
@@ -48,9 +54,12 @@
 #include <assert.h>
 #include <errno.h>
 #include <netdb.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -71,6 +80,7 @@ struct connection
   pid_t spawned_pid;
   int spawned_rfd;
   int spawned_wfd;
+  int spawned_stderr;
   struct sockaddr_in sa;
 };
 typedef struct connection *connection_list;
@@ -78,7 +88,13 @@ typedef struct connection *connection_list;
 connection_list conn_list = NULL;
 char *cvs_binary = NULL, *local_cvs_root = NULL, *remote_cvs_host = NULL,
   *remote_cvs_port = NULL, *remote_cvs_path = NULL;
+int daemonize = 1, daemonized = 0;
+int sockfd = -1;
 
+static const char rcsinfo[] = "$Id: cvs-proxy.cc,v 1.12 2003/08/15 14:20:39 mathie Exp $";
+
+void sighandler(int sig, siginfo_t *sip, void *scp);
+void cleanup(int retcode);
 int parse_args(int argc, char *argv[]);
 void usage(void);
 int init_socket(void);
@@ -87,24 +103,54 @@ int close_connection(struct connection *con);
 int fork_child(struct connection *con);
 int read_from_tcp(struct connection *con);
 int read_from_child(struct connection *con);
+int read_from_child_stderr(struct connection *con);
 int fdcpy(int dst, int src);
 void add_to_connection_list(connection_list *list, struct connection *item);
 void del_from_connection_list(connection_list *list, struct connection *item);
 void dump_connection_list(void);
+void log(int priority, const char*message, ...);
 
 int main (int argc, char *argv[]) 
 {
-  int sockfd;
-
+  struct sigaction act;
+  
   if (parse_args(argc, argv) < 0) {
     usage();
-    exit(EXIT_FAILURE);
+    cleanup(EXIT_FAILURE);
+  }
+
+  if(daemonize) {
+    if (daemon(0, 0) < 0) {
+      log(LOG_ERR, "Failed to fork as a daemon: %s.\n", strerror(errno));
+      cleanup(EXIT_FAILURE);
+    }
+    openlog(argv[0], LOG_PID, LOG_DAEMON);
+    daemonized = 1;
+  }
+
+  /* Handle sigint to cleanly kill the process */
+  act.sa_handler = (void *)sighandler;
+  act.sa_flags = SA_SIGINFO;
+  act.sa_mask = 0; /* Set it to 0 since Apple didn't bother to document
+                      its function at all! */
+  if (sigaction(SIGINT, &act, NULL) < 0) {
+    log(LOG_ERR, "Failed to register SIGINT signal handler: %s.\n",
+        strerror(errno));
+    cleanup(EXIT_FAILURE);
+  }
+  if (sigaction(SIGTERM, &act, NULL) < 0) {
+    log(LOG_ERR, "Failed to register SIGTERM signal handler: %s.\n",
+        strerror(errno));
+    cleanup(EXIT_FAILURE);
   }
   
   if ((sockfd = init_socket()) < 0) {
-    perror("init_socket()");
-    exit(EXIT_FAILURE);
+    log(LOG_ERR, "Failed to created TCP listening socket: %s.\n",
+        strerror(errno));
+    cleanup(EXIT_FAILURE);
   }
+
+  log(LOG_INFO, "Daemon version %s started.\n", rcsinfo);
   
   while(1) {
     struct timeval timeout;
@@ -117,16 +163,17 @@ int main (int argc, char *argv[])
     for(cur = conn_list; cur; cur = cur->next) {
       FD_SET(cur->tcp_fd, &rfds);
       FD_SET(cur->spawned_rfd, &rfds);
+      FD_SET(cur->spawned_stderr, &rfds);
     }
     
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
     n_active_fds = select(FD_SETSIZE, &rfds, NULL, NULL, &timeout);
     if (n_active_fds < 0) {
-      perror("select()");
-      exit(EXIT_FAILURE);
+      log(LOG_ERR, "Warning, select() failed: %s.\n", strerror(errno));
+      continue;
     } else if (n_active_fds == 0) {
-      printf("select() timed out.\n");
+      log(LOG_DEBUG, "select() timed out.\n");
       continue;
     }
 
@@ -134,7 +181,8 @@ int main (int argc, char *argv[])
     if(FD_ISSET(sockfd, &rfds)) {
       struct connection *newcon = accept_connection(sockfd);
       if (newcon == NULL) {
-        perror("accept_connection()");
+        log(LOG_ERR, "Failed to accept new incoming connection: %s\n",
+            strerror(errno));
       } else {
         add_to_connection_list(&conn_list, newcon);
       }
@@ -153,19 +201,56 @@ int main (int argc, char *argv[])
         read_from_child(cur);
         n_active_fds--;
       }
+      if(n_active_fds && FD_ISSET(cur->spawned_stderr, &rfds)) {
+        read_from_child_stderr(cur);
+        n_active_fds--;
+      }
     }
   }
   return 0;
+}
+
+void sighandler(int sig, siginfo_t *sip, void *scp) 
+{
+  switch(sig) {
+  case SIGINT:
+  case SIGTERM:
+    cleanup(EXIT_SUCCESS);
+    break;
+  default:
+    log(LOG_ERR, "Unexpected signal %d\n", sig);
+  }
+}
+
+void cleanup(int retcode)
+{
+  struct connection *cur, *next;
+  
+  if(sockfd != -1) {
+    if(close(sockfd) < 0) {
+      log(LOG_WARNING, "Failed to close listening TCP socket.\n");
+    }
+  }
+  next = conn_list;
+  while((cur = next) != NULL) {
+    next = cur->next;
+    close_connection(cur);
+    close_connection(cur);
+  }
+
+  log(LOG_INFO, "Daemon exiting, status %d.\n", retcode);
+  exit(retcode);
 }
 
 int parse_args(int argc, char *argv[]) 
 {
   struct stat sb;
   int ch;
-  while((ch = getopt(argc, argv, "b:l:h:p:d:")) != -1) {
-    printf("arg %c, value = %s.\n", ch, (optarg ? optarg : "(none)"));
-    
+  while((ch = getopt(argc, argv, "fb:l:h:p:d:")) != -1) {
     switch(ch) {
+    case 'f':
+      daemonize = 0;
+      break;
     case 'b':
       cvs_binary = strdup(optarg);
       break;
@@ -189,32 +274,32 @@ int parse_args(int argc, char *argv[])
     cvs_binary = strdup("/usr/bin/cvs");
   }
   if(access(cvs_binary, X_OK) < 0) {
-    perror("Cannot access cvs binary");
+    log(LOG_ERR, "Cannot access CVS binary: %s.\n", strerror(errno));
     return -1;
   }
   
   if(local_cvs_root == NULL) {
-    printf("%s: Local CVS root directory required.\n", argv[0]);
+    log(LOG_ERR, "%s: Local CVS root directory required.\n", argv[0]);
     return -1;
   }
   if(stat(local_cvs_root, &sb) < 0) {
-    perror("Cannot stat local CVS root");
+    log(LOG_ERR, "Cannot stat local CVS root: %s.\n", strerror(errno));
     return -1;
   }
   if(!(sb.st_mode & S_IFDIR)) {
-    printf("CVS root %s is not a directory.\n", local_cvs_root);
+    log(LOG_ERR, "CVS root %s is not a directory.\n", local_cvs_root);
     return -1;
   }
   
   if(remote_cvs_host == NULL) {
-    printf("%s: Remote CVS host required.\n", argv[0]);
+    log(LOG_ERR, "%s: Remote CVS host required.\n", argv[0]);
     return -1;
   }
   if(remote_cvs_port == NULL) {
     remote_cvs_port = strdup("2401");
   }
   if(remote_cvs_path == NULL) {
-    printf("%s: Remote CVS path required.\n", argv[0]);
+    log(LOG_ERR, "%s: Remote CVS path required.\n", argv[0]);
     return -1;
   }
   
@@ -223,12 +308,14 @@ int parse_args(int argc, char *argv[])
 
 void usage(void)
 {
-  printf("Usage:\n");
-  printf("  -b <filename>\tPath to CVS binary\n"
-         "  -l <path>\tLocal CVS root\n"
-         "  -h <hostname>\tRemote CVS host\n"
-         "  -p <port>\tRemote CVS port\n"
-         "  -d <path>\tRemote CVS root\n");
+  log(LOG_INFO, "Usage:\n");
+  log(LOG_INFO,
+      "  -f             Do not fork\n"
+      "  -b <filename>  Path to CVS binary\n"
+      "  -l <path>      Local CVS root\n"
+      "  -h <hostname>  Remote CVS host\n"
+      "  -p <port>      Remote CVS port\n"
+      "  -d <path>      Remote CVS root\n");
 }
 
 /* Initialise and bind a TCP socket to listen on.  Returns the bound
@@ -307,7 +394,7 @@ struct connection *accept_connection(int sockfd)
 
 int fork_child(struct connection *con)
 {
-  int pipe1[2], pipe2[2], on = 1;
+  int pipe1[2], pipe2[2], pipe3[2], on = 1;
   if(pipe(pipe1) < 0) {
     return -1;
   }
@@ -318,8 +405,7 @@ int fork_child(struct connection *con)
     errno = old_errno;
     return -1;
   }
-
-  if ((con->spawned_pid = fork()) < 0) {
+  if(pipe(pipe3) < 0) {
     int old_errno = errno;
     close(pipe1[0]);
     close(pipe1[1]);
@@ -327,9 +413,22 @@ int fork_child(struct connection *con)
     close(pipe2[1]);
     errno = old_errno;
     return -1;
+  }
+
+  if ((con->spawned_pid = fork()) < 0) {
+    int old_errno = errno;
+    close(pipe1[0]);
+    close(pipe1[1]);
+    close(pipe2[0]);
+    close(pipe2[1]);
+    close(pipe3[0]);
+    close(pipe3[1]);
+    errno = old_errno;
+    return -1;
   } else if(con->spawned_pid == 0) { /* Child process */
     close(pipe1[1]);
     close(pipe2[0]);
+    close(pipe3[0]);
     if(dup2(pipe1[0], STDIN_FILENO) < 0) {
       perror("dup2(STDIN)");
       exit(EXIT_FAILURE);
@@ -338,7 +437,10 @@ int fork_child(struct connection *con)
       perror("dup2(STDOUT)");
       exit(EXIT_FAILURE);
     }
-
+    if(dup2(pipe3[1], STDERR_FILENO) < 0) {
+      perror("dup2(STDERR)");
+      exit(EXIT_FAILURE);
+    }
     /* Close all other open descriptors */
     {
       int i;
@@ -354,15 +456,28 @@ int fork_child(struct connection *con)
   
   close(pipe1[0]);
   close(pipe2[1]);
+  close(pipe3[1]);
   con->spawned_wfd = pipe1[1];
   con->spawned_rfd = pipe2[0];
+  con->spawned_stderr = pipe3[0];
   if(ioctl(con->spawned_rfd, FIONBIO, &on) < 0) {
     int old_errno = errno;
     close(con->spawned_wfd);
     close(con->spawned_rfd);
+    close(con->spawned_stderr);
     errno = old_errno;
     return -1;
   }
+  if(ioctl(con->spawned_stderr, FIONBIO, &on) < 0) {
+    int old_errno = errno;
+    close(con->spawned_wfd);
+    close(con->spawned_rfd);
+    close(con->spawned_stderr);
+    errno = old_errno;
+    return -1;
+  }
+  log(LOG_INFO, "Connection accepted from %s:%d.\n",
+      inet_ntoa(con->sa.sin_addr), ntohs(con->sa.sin_port));
   return 0;
 }
 
@@ -372,40 +487,51 @@ int close_connection(struct connection *con)
   pid_t pid;
 
   if (con->spawned_wfd != -1) {
-    printf("Closing spawned_wfd %d.\n", con->spawned_wfd);
+    log(LOG_DEBUG, "Closing spawned_wfd %d.\n", con->spawned_wfd);
     if (close(con->spawned_wfd) < 0) {
-      printf("Warning: failed to close spawned_wfd %d\n", con->spawned_wfd);
+      log(LOG_DEBUG, "Warning: failed to close spawned_wfd %d\n",
+          con->spawned_wfd);
     }
     con->spawned_wfd = -1;
     return 0;
   }
 
-  printf("Closing tcp %d and rfd %d.\n", con->tcp_fd, con->spawned_rfd);
+  log(LOG_DEBUG, "Closing tcp %d, rfd %d and sterr %d.\n", con->tcp_fd,
+      con->spawned_rfd, con->spawned_stderr);
   if(close(con->tcp_fd) < 0) {
-    printf("Warning: Failed to close TCP descriptor %d\n", con->tcp_fd);
+    log(LOG_DEBUG, "Warning: Failed to close TCP descriptor %d: %s.\n",
+        con->tcp_fd, strerror(errno));
   }
   if(close(con->spawned_rfd) < 0) {
-    printf("Warning: Failed to close spawned_rfd %d\n", con->spawned_rfd);
+    log(LOG_DEBUG, "Warning: Failed to close spawned_rfd %d: %s.\n",
+        con->spawned_rfd, strerror(errno));
+  }
+  if(close(con->spawned_stderr) < 0) {
+    log(LOG_DEBUG, "Warning: Failed to close spawned_stderr %d: %s.\n",
+        con->spawned_rfd, strerror(errno));
   }
   
 
-  printf("Waiting on pid %d quitting.\n", con->spawned_pid);
+  log(LOG_DEBUG, "Waiting on pid %d quitting.\n", con->spawned_pid);
   if ((pid = waitpid(con->spawned_pid, &status, 0)) < 0) {
     return -1;
   } else if (pid == 0) {
-    printf("Bugger.  Nothing wanted to report its status.\n");
+    log(LOG_DEBUG, "Bugger.  Nothing wanted to report its status.\n");
   } else if (WIFEXITED(status)) {
-    printf("Child %d exited with status code %d.\n", pid, WEXITSTATUS(status));
+    log(LOG_DEBUG, "Child %d exited with status code %d.\n", pid,
+        WEXITSTATUS(status));
   } else if (WIFSIGNALED(status)) {
-    printf("Child %d was killed by signal %d%s.\n", pid, WTERMSIG(status),
-           WCOREDUMP(status) ? " (core dumped)" : "");
+    log(LOG_DEBUG, "Child %d was killed by signal %d%s.\n", pid,
+        WTERMSIG(status), WCOREDUMP(status) ? " (core dumped)" : "");
   } else if (WIFSTOPPED(status)) {
-    printf("Child %d is stopped by signal %d.\n", pid, WSTOPSIG(status));
+    log(LOG_DEBUG, "Child %d is stopped by signal %d.\n", pid,
+        WSTOPSIG(status));
   } else {
-    printf("Child %d exited through some bizarre incantation %d.\n",
-           pid, status);
+    log(LOG_DEBUG, "Child %d exited through some bizarre incantation %d.\n",
+        pid, status);
   }
-  printf("Disconnection from %s.\n", inet_ntoa(con->sa.sin_addr));
+  log(LOG_INFO, "Connection from %s:%d terminated.\n",
+      inet_ntoa(con->sa.sin_addr), ntohs(con->sa.sin_port));
 
   del_from_connection_list(&conn_list, con);
   free(con);
@@ -428,6 +554,28 @@ int read_from_child(struct connection *con)
     return close_connection(con);
   }
   return ret;
+}
+
+int read_from_child_stderr(struct connection *con)
+{
+  while (1) {
+    unsigned char buf[1024];
+    int n_bytes;
+
+    n_bytes = read(con->spawned_stderr, buf, 1023);
+    if (n_bytes < 0) {
+      if((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
+        /* No data left to read. */
+        return 0;
+      } else {
+        return -1;
+      }
+    } else if (n_bytes == 0) { /* EOF */
+      return 1; /* FIXME: Ewww, magic numbers. */
+    }
+    buf[n_bytes] = '\0';
+    log(LOG_WARNING, "%s", buf);
+  }
 }
 
 int fdcpy(int dst, int src) 
@@ -482,8 +630,20 @@ void dump_connection_list()
 {
   struct connection *cur;
   for(cur = conn_list; cur; cur = cur->next) {
-    printf("Connection pid = %d, tcp_fd = %d, rfd = %d, wfd = %d, s_port = %d.\n",
+    log(LOG_DEBUG, "Connection pid = %d, tcp_fd = %d, rfd = %d, wfd = %d, s_port = %d.\n",
            cur->spawned_pid, cur->tcp_fd, cur->spawned_rfd, cur->spawned_wfd,
            ntohs(cur->sa.sin_port));
   }
+}
+
+void log(int priority, const char *message, ...) 
+{
+  va_list args;
+  va_start(args, message);
+  if(daemonized) {
+    vsyslog(priority, message, args);
+  } else {
+    vfprintf(stderr, message, args);
+  }
+  va_end(args);
 }
