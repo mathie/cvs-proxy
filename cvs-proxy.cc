@@ -1,6 +1,10 @@
-/* $Id: cvs-proxy.cc,v 1.6 2003/08/14 15:12:14 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.7 2003/08/14 16:59:10 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.7  2003/08/14 16:59:10  mathie
+ * * Organise code into functions.  This should have reduced the
+ *   duplication of code somewhat.
+ *
  * Revision 1.6  2003/08/14 15:12:14  mathie
  * * Switch to using a dynamically-allocated connection list.  The code for
  *   coping with the head of the list being closed is fugly.
@@ -41,6 +45,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#define DEFAULT_LISTEN_PORT 2401
+
 struct connection 
 {
   struct connection *next;
@@ -50,274 +56,309 @@ struct connection
   int spawned_wfd;
   struct sockaddr_in sa;
 };
+typedef struct connection *connection_list;
 
-struct connection *cl_head = NULL;
+connection_list conn_list = NULL;
 struct connection fake_head;
 
+int init_socket(void);
+struct connection *accept_connection(int sockfd);
+int close_connection(struct connection *con);
+int fork_child(struct connection *con);
+int read_from_tcp(struct connection *con);
+int read_from_child(struct connection *con);
+int fdcpy(int dst, int src);
+void add_to_connection_list(connection_list *list, struct connection *item);
+void del_from_connection_list(connection_list *list, struct connection *item);
 void dump_connection_list(void);
 
 int main (int argc, char *argv[]) 
 {
-  int sockfd, ret = 0;
-  struct sockaddr_in addr;
-  struct servent *pserver_port;
-  
-  sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  if(sockfd < 0) {
-    perror("socket()");
+  int sockfd;
+
+  if ((sockfd = init_socket()) < 0) {
+    perror("init_socket()");
     exit(EXIT_FAILURE);
-  }
-
-  memset(&addr, 0, sizeof(addr));
-
-  pserver_port = getservbyname("cvspserver", "tcp");
-  if (pserver_port == NULL) {
-    addr.sin_port = htons(2401);
-  } else {
-    addr.sin_port = htons(pserver_port->s_port);
   }
   
-  if(bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-    perror("bind()");
-    exit(EXIT_FAILURE);
-  }
-
-  if(listen(sockfd, 32) != 0) {
-    perror("listen()");
-    exit(EXIT_FAILURE);
-  }
-
   while(1) {
     struct timeval timeout;
     struct fd_set rfds;
-    struct connection *cur = cl_head;
+    int n_active_fds;
+    struct connection *cur;
 
     dump_connection_list();
     
     FD_ZERO(&rfds);
     FD_SET(sockfd, &rfds);
-    while(cur) {
+    for(cur = conn_list; cur; cur = cur->next) {
       FD_SET(cur->tcp_fd, &rfds);
       FD_SET(cur->spawned_rfd, &rfds);
-      cur = cur->next;
     }
     
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
-    ret = select(FD_SETSIZE, &rfds, NULL, NULL, &timeout);
-    if (ret < 0) {
+    n_active_fds = select(FD_SETSIZE, &rfds, NULL, NULL, &timeout);
+    if (n_active_fds < 0) {
       perror("select()");
       exit(EXIT_FAILURE);
-    } else if (ret == 0) {
+    } else if (n_active_fds == 0) {
       printf("select() timed out.\n");
       continue;
     }
+
+    /* See if it's action on the TCP listening socket which woke us up */
     if(FD_ISSET(sockfd, &rfds)) {
-      int client_len = sizeof(struct sockaddr_in);
-      char on = 1;
-
-      {
-        struct connection *newcon = calloc(1, sizeof(struct connection));
-        newcon->tcp_fd = accept(sockfd,
-                                (struct sockaddr *)&newcon->sa,
-                                &client_len);
-        if(newcon->tcp_fd < 0) {
-          perror("accept()");
-          exit(EXIT_FAILURE);
-        }
-        if(ioctl(newcon->tcp_fd, FIONBIO, &on) < 0) {
-          perror("ioctl(FIONBIO)");
-          exit(EXIT_FAILURE);
-        }
-        printf("Connection accepted from %s\n",
-               inet_ntoa(newcon->sa.sin_addr));
-
-        /* Fork a child with a pipe */
-        {
-          int pipe1[2], pipe2[2];
-          if(pipe(pipe1) < 0) {
-            perror("pipe(pipe1)");
-            exit(EXIT_FAILURE);
-          }
-          if(pipe(pipe2) < 0) {
-            perror("pipe(pipe2)");
-            exit(EXIT_FAILURE);
-          }
-          if ((newcon->spawned_pid = fork()) < 0) {
-            perror("fork()");
-          } else if (newcon->spawned_pid > 0) { /* Parent processes */
-            close(pipe1[0]);
-            close(pipe2[1]);
-            newcon->spawned_wfd = pipe1[1];
-            newcon->spawned_rfd = pipe2[0];
-            if(ioctl(newcon->spawned_rfd, FIONBIO, &on) < 0) {
-              perror("ioctl(spawned_rfd, FIONBIO)");
-              exit(EXIT_FAILURE);
-            }
-          } else { /* Child process */
-            close(pipe1[1]);
-            close(pipe2[0]);
-            if(dup2(pipe1[0], STDIN_FILENO) < 0) {
-              perror("dup2(STDIN)");
-              exit(EXIT_FAILURE);
-            }
-            if(dup2(pipe2[1], STDOUT_FILENO) < 0) {
-              perror("dup2(STDOUT)");
-              exit(EXIT_FAILURE);
-            }
-            if (execl("/Users/mathie/src/cvs-proxy/echo-stdin", "echo-stdin", NULL) < 0) {
-              perror("exec()");
-              exit(EXIT_FAILURE);
-            }
-          }
-        }
-        newcon->next = cl_head;
-        cl_head = newcon;
+      struct connection *newcon = accept_connection(sockfd);
+      if (newcon == NULL) {
+        perror("accept_connection()");
+      } else {
+        add_to_connection_list(&conn_list, newcon);
       }
-      ret--;
+      n_active_fds--;
     }
-    for (cur = cl_head; cur; cur = cur->next) {
-      if (ret == 0) {
-        /* No more fds left to check */
-        break;
+    for(cur = conn_list; cur && n_active_fds; cur = cur->next) {
+      if(FD_ISSET(cur->tcp_fd, &rfds)) {
+        read_from_tcp(cur);
+        n_active_fds--;
       }
-      if(FD_ISSET(cur->tcp_fd, &rfds)) { 
-        while (1) {
-          unsigned char buf[70];
-          int n_bytes;
-
-          n_bytes = read(cur->tcp_fd, buf, 70);
-          if (n_bytes < 0) {
-            if((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
-              /* No data left to read. */
-              break;
-            } else {
-              perror("read()");
-              exit(EXIT_FAILURE);
-            }
-          } else if (n_bytes == 0) { /* EOF */
-            int status, ret;
-            close(cur->tcp_fd);
-            close(cur->spawned_wfd);
-            close(cur->spawned_rfd);
-            FD_CLR(cur->spawned_rfd, &rfds);
-
-            printf("Waiting on pid %d quitting.\n", cur->spawned_pid);
-            if ((ret = waitpid(cur->spawned_pid, &status, WNOHANG)) < 0) {
-              perror("waitpid()");
-              exit(EXIT_FAILURE);
-            } else if (ret == 0) {
-              printf("Bugger.  Nothing wanted to report its status.\n");
-            } else if (WIFEXITED(status)) {
-              printf("Child %d exited with status code %d.\n", ret, WEXITSTATUS(status));
-            } else if (WIFSIGNALED(status)) {
-              printf("Child %d was killed by signal %d%s.\n", ret, WTERMSIG(status),
-                     WCOREDUMP(status) ? " (core dumped)" : "");
-            } else if (WIFSTOPPED(status)) {
-              printf("Child %d is stopped by signal %d.\n", ret, WSTOPSIG(status));
-            } else {
-              printf("Child %d exited through some bizarre incantation %d.\n", ret, status);
-            }
-            printf("Disconnection from %s.\n", inet_ntoa(cur->sa.sin_addr));
-
-            if(cur == cl_head) {
-              cl_head = cur->next;
-              fake_head.next = cl_head;
-              free(cur);
-              cur = &fake_head;
-            } else {
-              struct connection *prev = cl_head;
-              while (prev && prev->next != cur) {
-                prev = prev->next;
-              }
-              assert(prev->next == cur);
-              prev->next = cur->next;
-              free(cur);
-              cur = prev;
-            }
-            break;
-          }
-
-          if(write(cur->spawned_wfd, buf, n_bytes) < 0) {
-            perror("write()");
-            exit(EXIT_FAILURE);
-          }
-        }
-        ret--;
-      }
-      if(ret && FD_ISSET(cur->spawned_rfd, &rfds)) { 
-        while (1) {
-          unsigned char buf[70];
-          int n_bytes;
-
-          n_bytes = read(cur->spawned_rfd, buf, 70);
-          if (n_bytes < 0) {
-            if((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
-              /* No data left to read. */
-              break;
-            } else {
-              perror("read()");
-              exit(EXIT_FAILURE);
-            }
-          } else if (n_bytes == 0) { /* EOF */
-            int status, ret;
-            close(cur->tcp_fd);
-            close(cur->spawned_wfd);
-            close(cur->spawned_rfd);
-            FD_CLR(cur->spawned_rfd, &rfds);
-
-            printf("Waiting on pid %d quitting.\n", cur->spawned_pid);
-            if ((ret = waitpid(cur->spawned_pid, &status, WNOHANG)) < 0) {
-              perror("waitpid()");
-              exit(EXIT_FAILURE);
-            } else if (ret == 0) {
-              printf("Bugger.  Nothing wanted to report its status.\n");
-            } else if (WIFEXITED(status)) {
-              printf("Child %d exited with status code %d.\n", ret, WEXITSTATUS(status));
-            } else if (WIFSIGNALED(status)) {
-              printf("Child %d was killed by signal %d%s.\n", ret, WTERMSIG(status),
-                     WCOREDUMP(status) ? " (core dumped)" : "");
-            } else if (WIFSTOPPED(status)) {
-              printf("Child %d is stopped by signal %d.\n", ret, WSTOPSIG(status));
-            } else {
-              printf("Child %d exited through some bizarre incantation %d.\n", ret, status);
-            }
-            printf("Disconnection from %s.\n", inet_ntoa(cur->sa.sin_addr));
-
-            if(cur == cl_head) {
-              cl_head = cur->next;
-              fake_head.next = cl_head;
-              free(cur);
-              cur = &fake_head;
-            } else {
-              struct connection *prev = cl_head;
-              while (prev && prev->next != cur) {
-                prev = prev->next;
-              }
-              assert(prev->next == cur);
-              prev->next = cur->next;
-              free(cur);
-              cur = prev;
-            }
-            break;
-          }
-
-          if(write(cur->tcp_fd, buf, n_bytes) < 0) {
-            perror("write()");
-            exit(EXIT_FAILURE);
-          }
-        }
-        ret--;
+      if(n_active_fds && FD_ISSET(cur->spawned_rfd, &rfds)) { 
+        read_from_child(cur);
+        n_active_fds--;
       }
     }
   }
   return 0;
 }
 
+/* Initialise and bind a TCP socket to listen on.  Returns the bound
+   socket on success or -1 on error (with errno set appropriately). */
+int init_socket(void) 
+{
+  int sockfd;
+  struct sockaddr_in addr;
+  struct servent *pserver_port;
+
+  sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if(sockfd < 0) {
+    return sockfd;
+  }
+
+  memset(&addr, 0, sizeof(addr));
+
+  pserver_port = getservbyname("cvspserver", "tcp");
+  if (pserver_port == NULL) {
+    addr.sin_port = htons(DEFAULT_LISTEN_PORT);
+  } else {
+    addr.sin_port = htons(pserver_port->s_port);
+  }
+
+  if(bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    int old_errno = errno;
+    close(sockfd);
+    errno = old_errno;
+    return -1;
+  }
+
+  if(listen(sockfd, 32) != 0) {
+    int old_errno = errno;
+    close(sockfd);
+    errno = old_errno;
+    return -1;
+  }
+
+  return sockfd;
+}
+
+struct connection *accept_connection(int sockfd) 
+{
+  int client_len = sizeof(struct sockaddr_in);
+  char on = 1;
+  
+  struct connection *newcon = calloc(1, sizeof(struct connection));
+  if(newcon == NULL) {
+    return NULL;
+  }
+  
+  newcon->tcp_fd = accept(sockfd, (struct sockaddr *)&newcon->sa, &client_len);
+  if(newcon->tcp_fd < 0) {
+    int old_errno = errno;
+    free(newcon);
+    errno = old_errno;
+    return NULL;
+  }
+  if(ioctl(newcon->tcp_fd, FIONBIO, &on) < 0) {
+    int old_errno = errno;
+    close(newcon->tcp_fd);
+    free(newcon);
+    errno = old_errno;
+    return NULL;
+  }
+
+  if(fork_child(newcon) < 0) {
+    int old_errno = errno;
+    close(newcon->tcp_fd);
+    free(newcon);
+    errno = old_errno;
+    return NULL;
+  }
+  return newcon;
+}
+
+int fork_child(struct connection *con)
+{
+  int pipe1[2], pipe2[2], on = 1;
+  if(pipe(pipe1) < 0) {
+    return -1;
+  }
+  if(pipe(pipe2) < 0) {
+    int old_errno = errno;
+    close(pipe1[0]);
+    close(pipe1[1]);
+    errno = old_errno;
+    return -1;
+  }
+
+  if ((con->spawned_pid = fork()) < 0) {
+    int old_errno = errno;
+    close(pipe1[0]);
+    close(pipe1[1]);
+    close(pipe2[0]);
+    close(pipe2[1]);
+    errno = old_errno;
+    return -1;
+  } else if(con->spawned_pid == 0) { /* Child process */
+    close(pipe1[1]);
+    close(pipe2[0]);
+    if(dup2(pipe1[0], STDIN_FILENO) < 0) {
+      perror("dup2(STDIN)");
+      exit(EXIT_FAILURE);
+    }
+    if(dup2(pipe2[1], STDOUT_FILENO) < 0) {
+      perror("dup2(STDOUT)");
+      exit(EXIT_FAILURE);
+    }
+    if (execl("/Users/mathie/src/cvs-proxy/echo-stdin", "echo-stdin", NULL) < 0) {
+      perror("exec()");
+      exit(EXIT_FAILURE);
+    }
+  }
+  
+  close(pipe1[0]);
+  close(pipe2[1]);
+  con->spawned_wfd = pipe1[1];
+  con->spawned_rfd = pipe2[0];
+  if(ioctl(con->spawned_rfd, FIONBIO, &on) < 0) {
+    int old_errno = errno;
+    close(con->spawned_wfd);
+    close(con->spawned_rfd);
+    errno = old_errno;
+    return -1;
+  }
+  return 0;
+}
+
+int close_connection(struct connection *con) 
+{
+  int status;
+  pid_t pid;
+  close(con->tcp_fd);
+  close(con->spawned_wfd);
+  close(con->spawned_rfd);
+
+  printf("Waiting on pid %d quitting.\n", con->spawned_pid);
+  if ((pid = waitpid(con->spawned_pid, &status, WNOHANG)) < 0) {
+    return -1;
+  } else if (pid == 0) {
+    printf("Bugger.  Nothing wanted to report its status.\n");
+  } else if (WIFEXITED(status)) {
+    printf("Child %d exited with status code %d.\n", pid, WEXITSTATUS(status));
+  } else if (WIFSIGNALED(status)) {
+    printf("Child %d was killed by signal %d%s.\n", pid, WTERMSIG(status),
+           WCOREDUMP(status) ? " (core dumped)" : "");
+  } else if (WIFSTOPPED(status)) {
+    printf("Child %d is stopped by signal %d.\n", pid, WSTOPSIG(status));
+  } else {
+    printf("Child %d exited through some bizarre incantation %d.\n",
+           pid, status);
+  }
+  printf("Disconnection from %s.\n", inet_ntoa(con->sa.sin_addr));
+
+  del_from_connection_list(&conn_list, con);
+  free(con);
+  return 0;
+}
+
+int read_from_tcp(struct connection *con)
+{
+  int ret = fdcpy(con->spawned_wfd, con->tcp_fd);
+  if (ret == 1) {
+    return close_connection(con);
+  }
+  return ret;
+}
+
+int read_from_child(struct connection *con)
+{
+  int ret = fdcpy(con->tcp_fd, con->spawned_rfd);
+  if (ret == 1) {
+    return close_connection(con);
+  }
+  return ret;
+}
+
+int fdcpy(int dst, int src) 
+{
+  while (1) {
+    unsigned char buf[70];
+    int n_bytes;
+
+    n_bytes = read(src, buf, 70);
+    if (n_bytes < 0) {
+      if((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
+        /* No data left to read. */
+        return 0;
+      } else {
+        return -1;
+      }
+    } else if (n_bytes == 0) { /* EOF */
+      return 1; /* FIXME: Ewww, magic numbers. */
+    }
+
+    if(write(dst, buf, n_bytes) < 0) {
+      return -1;
+    }
+  }
+}
+
+void add_to_connection_list(connection_list *list, struct connection *item) 
+{
+  item->next = *list;
+  (*list) = item;
+}
+
+void del_from_connection_list(connection_list *list, struct connection *item)
+{
+  struct connection *cur;
+  
+  if(*list == item) {
+    *list = item->next;
+    return;
+  }
+  for(cur = *list; cur; cur = cur->next) {
+    if(cur->next == item) {
+      cur->next = item->next;
+      return;
+    }
+  }
+  assert(0); /* We don't deal with items not being on lists very well,
+                do we? */
+}
+
 void dump_connection_list() 
 {
   struct connection *cur;
-  for(cur = cl_head; cur; cur = cur->next) {
+  for(cur = conn_list; cur; cur = cur->next) {
     printf("Connection pid = %d, tcp_fd = %d, rfd = %d, wfd = %d, s_port = %d.\n",
            cur->spawned_pid, cur->tcp_fd, cur->spawned_rfd, cur->spawned_wfd,
            ntohs(cur->sa.sin_port));
