@@ -1,6 +1,11 @@
-/* $Id: cvs-proxy.cc,v 1.7 2003/08/14 16:59:10 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.8 2003/08/15 06:10:12 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.8  2003/08/15 06:10:12  mathie
+ * * Closing of connections now works reliably (though there is the
+ *   assumption that the client will be well-behaved).  Still skipping a
+ *   descriptor from the list in the case of a closed connection though.
+ *
  * Revision 1.7  2003/08/14 16:59:10  mathie
  * * Organise code into functions.  This should have reduced the
  *   duplication of code somewhat.
@@ -238,6 +243,13 @@ int fork_child(struct connection *con)
       perror("dup2(STDOUT)");
       exit(EXIT_FAILURE);
     }
+
+    /* Close all other open descriptors */
+    {
+      int i;
+      for(i = 3; i < getdtablesize(); i++) close(i); 
+    }
+    
     if (execl("/Users/mathie/src/cvs-proxy/echo-stdin", "echo-stdin", NULL) < 0) {
       perror("exec()");
       exit(EXIT_FAILURE);
@@ -262,12 +274,27 @@ int close_connection(struct connection *con)
 {
   int status;
   pid_t pid;
-  close(con->tcp_fd);
-  close(con->spawned_wfd);
-  close(con->spawned_rfd);
+
+  if (con->spawned_wfd != -1) {
+    printf("Closing spawned_wfd %d.\n", con->spawned_wfd);
+    if (close(con->spawned_wfd) < 0) {
+      printf("Warning: failed to close spawned_wfd %d\n", con->spawned_wfd);
+    }
+    con->spawned_wfd = -1;
+    return 0;
+  }
+
+  printf("Closing tcp %d and rfd %d.\n", con->tcp_fd, con->spawned_rfd);
+  if(close(con->tcp_fd) < 0) {
+    printf("Warning: Failed to close TCP descriptor %d\n", con->tcp_fd);
+  }
+  if(close(con->spawned_rfd) < 0) {
+    printf("Warning: Failed to close spawned_rfd %d\n", con->spawned_rfd);
+  }
+  
 
   printf("Waiting on pid %d quitting.\n", con->spawned_pid);
-  if ((pid = waitpid(con->spawned_pid, &status, WNOHANG)) < 0) {
+  if ((pid = waitpid(con->spawned_pid, &status, 0)) < 0) {
     return -1;
   } else if (pid == 0) {
     printf("Bugger.  Nothing wanted to report its status.\n");
