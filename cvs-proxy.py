@@ -1,6 +1,6 @@
 #/usr/bin/python
 
-# $Id: cvs-proxy.py,v 1.1 2003/08/10 08:23:54 mathie Exp $
+# $Id: cvs-proxy.py,v 1.2 2003/08/10 08:43:10 mathie Exp $
 #
 # CVS Proxy server
 # Copyright (c) 2003 Graeme Mathieson <mathie@wossname.org.uk>
@@ -20,9 +20,8 @@
 # Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
 #
 # $Log: cvs-proxy.py,v $
-# Revision 1.1  2003/08/10 08:23:54  mathie
-# Initial revision
-#
+# Revision 1.2  2003/08/10 08:43:10  mathie
+# * Use the new-format skeleton, which does the main() bit.
 #
 
 """cvs-proxy is a CVS proxy server which will, when possible, serve requests
@@ -34,14 +33,29 @@
    (perhaps with rsync kicked from a cron job or a post-commit script)."""
 
 # Imports
+import sys
 import socket, SocketServer
+
+def main():
+  """main function, if this this file is being run as a script, rather than
+     being imported by another script"""
+  try:
+    myPort = socket.getservbyname('cvspserver', 'tcp')
+  except:
+    myPort = 2401 # Default to port 2401, the well known port for CVS
+
+  myServer = SocketServer.TCPServer(('', myPort), MyHandler)
+  try:
+    myServer.serve_forever()
+  except KeyboardInterrupt:
+    print "Ctrl-C caught, exiting..."
 
 class MyHandler(SocketServer.BaseRequestHandler):
   def handle(self):
     while 1:
       dataReceived = self.request.recv(1024)
       if not dataReceived:
-	break
+        break
       self.request.send(dataReceived)
       print dataReceived
   def setup(self):
@@ -49,13 +63,8 @@ class MyHandler(SocketServer.BaseRequestHandler):
   def finish(self):
       print "Disconnected: ", self.client_address
 
-try:
-  myPort = socket.getservbyname('cvspserver', 'tcp')
-except:
-  myPort = 2401 # Default to port 2401, the well-known-port for CVS
+# Call the main() function if this file is being run as a script, else do
+# nothing (which means it can be imported without any major side effects).
+if __name__ == "__main__":
+  sys.exit(main())
 
-myServer = SocketServer.TCPServer(('', myPort), MyHandler)
-try:
-  myServer.serve_forever()
-except KeyboardInterrupt:
-  print "Exiting."
