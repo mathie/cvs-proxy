@@ -1,4 +1,4 @@
-$Id: TODO,v 1.2 2003/08/14 07:39:56 mathie Exp $
+$Id: TODO,v 1.3 2003/08/14 17:04:02 mathie Exp $
 
 TODO list for CVS Proxy
 -----------------------
@@ -8,3 +8,14 @@ TODO list for CVS Proxy
   - Local CVS binary path
   - Local CVS root
   - Remote CVS host, port and path
+* Closing connections is broken:
+  - When a connection is closed it's deleted from conn_list.  The for
+    loop which goes through all the fds to see which ones need attention
+    after select will wind up skipping a connection.
+  - waitpid() never actually cleans up the zombie'd child.  It's
+    probably happening too quickly (but without WHANGUP it wasn't
+    reaping the child *at all* in some circumstances).  I think what I
+    need to do is move ones I'm trying to delete from the conn_list to a
+    del_list and deal with them separately, first closing the socket one
+    direction, then waiting 'til the client has closed the socket the
+    other direction before being all final about it.
