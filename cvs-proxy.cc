@@ -1,6 +1,9 @@
-/* $Id: cvs-proxy.cc,v 1.8 2003/08/15 06:10:12 mathie Exp $
+/* $Id: cvs-proxy.cc,v 1.9 2003/08/15 07:04:12 mathie Exp $
  *
  * $Log: cvs-proxy.cc,v $
+ * Revision 1.9  2003/08/15 07:04:12  mathie
+ * * Basic argument parsing and validation.
+ *
  * Revision 1.8  2003/08/15 06:10:12  mathie
  * * Closing of connections now works reliably (though there is the
  *   assumption that the client will be well-behaved).  Still skipping a
@@ -35,20 +38,21 @@
  */
 
 #include <assert.h>
+#include <errno.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <netdb.h>
-#include <errno.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/time.h>
-#include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #define DEFAULT_LISTEN_PORT 2401
 
@@ -64,8 +68,11 @@ struct connection
 typedef struct connection *connection_list;
 
 connection_list conn_list = NULL;
-struct connection fake_head;
+char *cvs_binary = NULL, *local_cvs_root = NULL, *remote_cvs_host = NULL,
+  *remote_cvs_port = NULL, *remote_cvs_path = NULL;
 
+int parse_args(int argc, char *argv[]);
+void usage(void);
 int init_socket(void);
 struct connection *accept_connection(int sockfd);
 int close_connection(struct connection *con);
@@ -81,6 +88,11 @@ int main (int argc, char *argv[])
 {
   int sockfd;
 
+  if (parse_args(argc, argv) < 0) {
+    usage();
+    exit(EXIT_FAILURE);
+  }
+  
   if ((sockfd = init_socket()) < 0) {
     perror("init_socket()");
     exit(EXIT_FAILURE);
@@ -134,6 +146,76 @@ int main (int argc, char *argv[])
     }
   }
   return 0;
+}
+
+int parse_args(int argc, char *argv[]) 
+{
+  struct stat sb;
+  int ch;
+  while((ch = getopt(argc, argv, "b:l:h:p:d")) != -1) {
+    switch(ch) {
+    case 'b':
+      cvs_binary = strdup(optarg);
+      break;
+    case 'l':
+      local_cvs_root = strdup(optarg);
+      break;
+    case 'h':
+      remote_cvs_host = strdup(optarg);
+      break;
+    case 'p':
+      remote_cvs_port = strdup(optarg);
+      break;
+    case 'd':
+      remote_cvs_path = strdup(optarg);
+    default:
+      return -1;
+    }
+  }
+  if(cvs_binary == NULL) {
+    cvs_binary = strdup("/usr/bin/cvs");
+  }
+  if(access(cvs_binary, X_OK) < 0) {
+    perror("Cannot access cvs binary");
+    return -1;
+  }
+  
+  if(local_cvs_root == NULL) {
+    printf("%s: Local CVS root directory required.\n", argv[0]);
+    return -1;
+  }
+  if(stat(local_cvs_root, &sb) < 0) {
+    perror("Cannot stat local CVS root");
+    return -1;
+  }
+  if(!(sb.st_mode & S_IFDIR)) {
+    printf("CVS root %s is not a directory.\n", local_cvs_root);
+    return -1;
+  }
+  
+  if(remote_cvs_host == NULL) {
+    printf("%s: Remote CVS host required.\n", argv[0]);
+    return -1;
+  }
+  if(remote_cvs_port == NULL) {
+    remote_cvs_port = strdup("2401");
+  }
+  if(remote_cvs_path == NULL) {
+    printf("%s: Remote CVS path required.\n", argv[0]);
+    return -1;
+  }
+  
+  return 0;
+}
+
+void usage(void)
+{
+  printf("Usage:\n");
+  printf("  -b <filename>\tPath to CVS binary\n"
+         "  -l <path>\tLocal CVS root\n"
+         "  -h <hostname>\tRemote CVS host\n"
+         "  -p <port>\tRemote CVS port\n"
+         "  -d <path>\tRemote CVS root\n");
 }
 
 /* Initialise and bind a TCP socket to listen on.  Returns the bound
